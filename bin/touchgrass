@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""
+touchgrass — local AI-usage detector.
+
+What's new:
+  * Distinguishes ALIVE vs ACTIVE processes using CPU delta + session-file mtime.
+  * Long-running idle terminals no longer trigger false alarms.
+  * New rules: forgotten_session, active_streak; smarter night_use.
+  * `touchgrass doctor`  self-test
+  * `touchgrass status`  daemon health
+  * `touchgrass kill-stale`  reap idle long-running AI procs
+  * JSON config at ~/.touchgrass/config.json (overrides defaults)
+  * Schema migrations preserved across versions.
+
+Privacy: only process metadata + file mtimes. Never reads prompts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ─── paths ───────────────────────────────────────────────────────────────
+
+HOME       = Path.home()
+ROOT       = HOME / ".touchgrass"
+DB_PATH    = ROOT / "data" / "touchgrass.sqlite"
+CONF_PATH  = ROOT / "config.json"
+LOG_PATH   = ROOT / "data" / "watch.log"
+PLIST_PATH = HOME / "Library" / "LaunchAgents" / "com.touchgrass.watch.plist"
+LABEL      = "com.touchgrass.watch"
+SCHEMA_VER = 2
+
+# ─── defaults (override in config.json) ──────────────────────────────────
+
+DEFAULTS = {
+    "sample_interval_s":    60,
+    "active_cpu_delta_s":    1.0,
+    "active_cpu_pct":        2.0,
+    "active_file_window_s": 120,
+    "concurrent_threshold":  4,
+    "long_active_hours":    6,
+    "forgotten_alive_h":   24,
+    "forgotten_idle_h":     6,
+    "night_start_hour":     0,
+    "night_end_hour":       6,
+    "daily_active_hours":   6,
+    "active_streak_days":   7,
+    "notify_cooldown_s":   1800,
+    "ignored_tools":       ["copilot-lsp"],
+    "hid_idle_skip_s":     900,
+}
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONF_PATH.exists():
+        try:
+            cfg.update(json.loads(CONF_PATH.read_text()))
+        except Exception as e:
+            sys.stderr.write("config error: %s - using defaults\n" % e)
+    return cfg
+
+CFG = load_config()
+
+# ─── allowlist ───────────────────────────────────────────────────────────
+
+AI_PATTERNS = [
+    r"(^|/)claude(\s|$)",
+    r"(^|/)claude-code(\s|$)",
+    r"(^|/)opencode(\s|$)",
+    r"(^|/)codex(\s|$)",
+    r"(^|/)aider(\s|$)",
+    r"(^|/)cursor-agent(\s|$)",
+    r"(^|/)windsurf-agent(\s|$)",
+    r"/copilot-cli/.*?/copilot(\s|$)",
+    r"copilot-language-server",
+]
+AI_RE = re.compile("|".join(AI_PATTERNS))
+EXCLUDE = re.compile(r"CursorUIViewService|TextInput|grep |touchgrass")
+
+def tool_of(cmd):
+    if "copilot-language-server" in cmd: return "copilot-lsp"
+    if "/copilot-cli/" in cmd or cmd.endswith(" copilot") or cmd == "copilot":
+        return "copilot"
+    if "claude-code" in cmd: return "claude-code"
+    if re.search(r"(^|/)claude(\s|$)", cmd): return "claude"
+    if "opencode"    in cmd: return "opencode"
+    if "codex"       in cmd: return "codex"
+    if "aider"       in cmd: return "aider"
+    if "cursor-agent" in cmd: return "cursor"
+    if "windsurf"    in cmd: return "windsurf"
+    return "other"
+
+# ─── db + migrations ─────────────────────────────────────────────────────
+
+BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  val TEXT
+);
+CREATE TABLE IF NOT EXISTS samples (
+  ts        INTEGER NOT NULL,
+  pid       INTEGER NOT NULL,
+  ppid      INTEGER,
+  etime_s   INTEGER,
+  cpu_s     REAL,
+  pcpu      REAL,
+  rss_kb    INTEGER,
+  tool      TEXT,
+  command   TEXT,
+  cwd       TEXT,
+  active    INTEGER DEFAULT 0,
+  file_mt   INTEGER,
+  PRIMARY KEY (ts, pid)
+);
+CREATE TABLE IF NOT EXISTS verdicts (
+  ts       INTEGER NOT NULL,
+  rule     TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  payload  TEXT,
+  PRIMARY KEY (ts, rule)
+);
+"""
+
+POST_MIGRATE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_samples_ts        ON samples(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_samples_tool_ts   ON samples(tool, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_samples_pid_ts    ON samples(pid, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_samples_active_ts ON samples(active, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_verdicts_rule_ts  ON verdicts(rule, ts)",
+]
+
+MIGRATIONS = {
+    2: [
+        "ALTER TABLE samples ADD COLUMN cpu_s   REAL",
+        "ALTER TABLE samples ADD COLUMN active  INTEGER DEFAULT 0",
+        "ALTER TABLE samples ADD COLUMN file_mt INTEGER",
+    ],
+}
+
+def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(BASE_SCHEMA)
+    row = conn.execute("SELECT val FROM meta WHERE key='schema_ver'").fetchone()
+    current = int(row[0]) if row else 0
+    for v, stmts in sorted(MIGRATIONS.items()):
+        if v > current:
+            for s in stmts:
+                try: conn.execute(s)
+                except sqlite3.OperationalError: pass
+    for s in POST_MIGRATE_INDEXES:
+        try: conn.execute(s)
+        except sqlite3.OperationalError: pass
+    conn.execute("INSERT OR REPLACE INTO meta(key,val) VALUES ('schema_ver',?)",
+                 (str(SCHEMA_VER),))
+    conn.commit()
+    return conn
+
+# ─── ps + parsing ────────────────────────────────────────────────────────
+
+def parse_etime(s):
+    s = s.strip(); days = 0
+    if "-" in s: d, s = s.split("-", 1); days = int(d)
+    parts = [int(p) for p in s.split(":")]
+    while len(parts) < 3: parts.insert(0, 0)
+    h, m, sec = parts
+    return days*86400 + h*3600 + m*60 + sec
+
+def parse_cputime(s):
+    s = s.strip(); days = 0
+    if "-" in s: d, s = s.split("-", 1); days = int(d)
+    parts = s.split(":")
+    while len(parts) < 3: parts.insert(0, "0")
+    h, m, sec = parts
+    return days*86400 + int(h)*3600 + int(m)*60 + float(sec)
+
+def snapshot():
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,time=,pcpu=,rss=,command="],
+            capture_output=True, text=True, timeout=5).stdout
+    except Exception as e:
+        sys.stderr.write("ps failed: %s\n" % e); return []
+    rows = []
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line: continue
+        parts = line.split(None, 6)
+        if len(parts) < 7: continue
+        pid, ppid, etime, cput, pcpu, rss, cmd = parts
+        if not AI_RE.search(cmd): continue
+        if EXCLUDE.search(cmd):   continue
+        try:
+            rows.append({
+                "pid":   int(pid),
+                "ppid":  int(ppid),
+                "etime": parse_etime(etime),
+                "cpu_s": parse_cputime(cput),
+                "pcpu":  float(pcpu),
+                "rss":   int(rss),
+                "cmd":   cmd,
+                "tool":  tool_of(cmd),
+            })
+        except ValueError:
+            continue
+    return rows
+
+def lsof_cwd(pid):
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+    except Exception:
+        return None
+    return None
+
+def hid_idle_s():
+    try:
+        out = subprocess.run(["ioreg", "-c", "IOHIDSystem"],
+                             capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if "HIDIdleTime" in line:
+                return int(int(line.split("=")[-1].strip()) / 1_000_000_000)
+    except Exception:
+        pass
+    return 0
+
+# ─── activity detection ──────────────────────────────────────────────────
+
+def encode_claude(path):
+    return path.replace("/", "-")
+
+SESSION_ROOTS = {
+    "claude":     [(HOME / ".claude" / "projects", encode_claude)],
+    "claude-code":[(HOME / ".claude" / "projects", encode_claude)],
+    "opencode":   [(HOME / ".local/share/opencode" / "project", encode_claude),
+                   (HOME / ".config/opencode" / "project", encode_claude)],
+    "copilot":    [(HOME / ".copilot" / "session-state", None)],
+}
+
+def pid_open_session_mtime(pid, tool):
+    """Inspect pid's open files; return max mtime of any file under this tool's
+    session root.  This avoids the false-positive of a global root scan."""
+    roots = [str(r) for r, _ in SESSION_ROOTS.get(tool, []) if r.exists()]
+    if not roots: return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(pid), "-Fn"],
+            capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return None
+    best = 0
+    for line in out.splitlines():
+        if not line.startswith("n"): continue
+        path = line[1:]
+        if not any(path.startswith(r) for r in roots): continue
+        try:
+            m = int(os.stat(path).st_mtime)
+            if m > best: best = m
+        except OSError: pass
+    return best or None
+
+def latest_session_mtime(tool, cwd, pid=None):
+    # 1) most reliable: files this pid actually holds open
+    if pid is not None:
+        m = pid_open_session_mtime(pid, tool)
+        if m is not None: return m
+    # 2) tools with a deterministic cwd->dir mapping (claude/opencode)
+    roots = SESSION_ROOTS.get(tool, [])
+    best = 0
+    for root, enc in roots:
+        if not root.exists() or not enc or not cwd: continue
+        d = root / enc(cwd)
+        if not d.exists(): continue
+        try:
+            for entry in os.scandir(d):
+                if entry.is_file():
+                    m = int(entry.stat().st_mtime)
+                    if m > best: best = m
+                elif entry.is_dir():
+                    try:
+                        for sub in os.scandir(entry.path):
+                            if sub.is_file():
+                                m = int(sub.stat().st_mtime)
+                                if m > best: best = m
+                    except OSError: pass
+        except OSError: pass
+    return best or None
+
+def compute_activity(conn, now, rows):
+    for r in rows:
+        prev = conn.execute(
+            "SELECT ts, cpu_s FROM samples WHERE pid=? AND ts<? "
+            "ORDER BY ts DESC LIMIT 1",
+            (r["pid"], now)).fetchone()
+        cpu_delta = None
+        if prev and prev[1] is not None:
+            cpu_delta = max(0.0, r["cpu_s"] - prev[1])
+        r["cpu_delta"] = cpu_delta
+
+        r["cwd"] = lsof_cwd(r["pid"]) if r["tool"] != "copilot-lsp" else None
+        r["file_mt"] = latest_session_mtime(r["tool"], r["cwd"], r["pid"])
+
+        by_cpu_delta = cpu_delta is not None and cpu_delta >= CFG["active_cpu_delta_s"]
+        by_pcpu      = r["pcpu"] >= CFG["active_cpu_pct"]
+        by_file      = r["file_mt"] is not None and (now - r["file_mt"]) <= CFG["active_file_window_s"]
+        r["active"]  = 1 if (by_cpu_delta or by_pcpu or by_file) else 0
+        r["why"]     = ",".join([k for k,v in (
+            ("cpu",  by_cpu_delta), ("pcpu", by_pcpu), ("file", by_file)) if v]) or "-"
+
+# ─── notify ──────────────────────────────────────────────────────────────
+
+def notify(title, body):
+    safe = body.replace('"', "'").replace("\\", "")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification "%s" with title "%s"' % (safe, title)],
+            timeout=3)
+    except Exception:
+        pass
+
+# ─── rules ───────────────────────────────────────────────────────────────
+
+def active_seconds_for_pid(conn, pid, since):
+    n = conn.execute(
+        "SELECT COUNT(*) FROM samples WHERE pid=? AND ts>=? AND active=1",
+        (pid, since)).fetchone()[0]
+    return n * CFG["sample_interval_s"]
+
+def daily_active_minutes(conn, now):
+    start = int(dt.datetime.fromtimestamp(now)
+                  .replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+    return conn.execute(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND active=1",
+        (start,)).fetchone()[0]
+
+def evaluate(conn, now, rows):
+    verdicts = []
+    ignored = set(CFG["ignored_tools"])
+    counted = [r for r in rows if r["tool"] not in ignored]
+    active  = [r for r in counted if r["active"]]
+    idle_s  = hid_idle_s()
+
+    if len(active) >= CFG["concurrent_threshold"]:
+        tools = ", ".join(sorted({r["tool"] for r in active}))
+        verdicts.append((
+            "parallel_sprawl", "warn",
+            "%d ACTIVE agents (%s). Supervising them all?" % (len(active), tools),
+        ))
+
+    for r in active:
+        active_h = active_seconds_for_pid(conn, r["pid"], now - 30*86400) / 3600
+        if active_h >= CFG["long_active_hours"]:
+            verdicts.append((
+                "long_active:%d" % r["pid"], "warn",
+                "%s pid=%d active %.1fh cumulative. Take a break." % (
+                    r["tool"], r["pid"], active_h),
+            ))
+
+    for r in counted:
+        if r["etime"] < CFG["forgotten_alive_h"] * 3600: continue
+        last_active = conn.execute(
+            "SELECT MAX(ts) FROM samples WHERE pid=? AND active=1",
+            (r["pid"],)).fetchone()[0]
+        quiet_for = (now - last_active) if last_active else r["etime"]
+        if quiet_for >= CFG["forgotten_idle_h"] * 3600:
+            verdicts.append((
+                "forgotten:%d" % r["pid"], "info",
+                "%s pid=%d alive %.0fh, idle %.0fh - kill it?" % (
+                    r["tool"], r["pid"], r["etime"]/3600, quiet_for/3600),
+            ))
+
+    hour = dt.datetime.fromtimestamp(now).hour
+    in_night = CFG["night_start_hour"] <= hour < CFG["night_end_hour"]
+    if in_night and active and idle_s < CFG["hid_idle_skip_s"]:
+        verdicts.append((
+            "night_use", "warn",
+            "%d active agents at %02d:00. Sleep is the intervention." % (len(active), hour),
+        ))
+
+    am = daily_active_minutes(conn, now)
+    if am >= CFG["daily_active_hours"] * 60:
+        verdicts.append((
+            "daily_cap", "warn",
+            "%.1fh of ACTIVE AI usage today. Wrap up." % (am/60),
+        ))
+
+    days = []
+    for back in range(CFG["active_streak_days"]):
+        d0 = int((dt.datetime.fromtimestamp(now) - dt.timedelta(days=back))
+                   .replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+        d1 = d0 + 86400
+        mins = conn.execute(
+            "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND ts<? AND active=1",
+            (d0,d1)).fetchone()[0]
+        days.append(mins >= CFG["daily_active_hours"]*60)
+    if days and all(days) and len(days) >= CFG["active_streak_days"]:
+        verdicts.append((
+            "active_streak", "warn",
+            "%d straight days above daily cap. This is the pattern." % len(days),
+        ))
+
+    return verdicts
+
+def record_verdicts(conn, now, verdicts):
+    for rule, sev, payload in verdicts:
+        last = conn.execute(
+            "SELECT ts FROM verdicts WHERE rule=? ORDER BY ts DESC LIMIT 1",
+            (rule,)).fetchone()
+        if last and now - last[0] < CFG["notify_cooldown_s"]:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO verdicts(ts,rule,severity,payload) VALUES (?,?,?,?)",
+            (now, rule, sev, payload))
+        notify("touchgrass - %s" % sev, payload)
+    conn.commit()
+
+# ─── commands ────────────────────────────────────────────────────────────
+
+def cmd_sample(_a):
+    conn = db(); now = int(time.time())
+    rows = snapshot()
+    compute_activity(conn, now, rows)
+    for r in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO samples"
+            "(ts,pid,ppid,etime_s,cpu_s,pcpu,rss_kb,tool,command,cwd,active,file_mt) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now, r["pid"], r["ppid"], r["etime"], r["cpu_s"], r["pcpu"],
+             r["rss"], r["tool"], r["cmd"], r.get("cwd"), r["active"], r["file_mt"]))
+    conn.commit()
+    record_verdicts(conn, now, evaluate(conn, now, rows))
+    return 0
+
+def cmd_watch(_a):
+    print("touchgrass v2 - watching every %ds (Ctrl-C to stop)" % CFG["sample_interval_s"])
+    while True:
+        try: cmd_sample(None)
+        except Exception as e: sys.stderr.write("sample error: %s\n" % e)
+        time.sleep(CFG["sample_interval_s"])
+
+def cmd_live(_a):
+    conn = db(); now = int(time.time())
+    rows = snapshot()
+    compute_activity(conn, now, rows)
+    if not rows:
+        print("no AI agents running."); return 0
+    print("%-12s %7s %9s %9s %6s %8s %-7s %-10s  %s" % (
+        "TOOL","PID","ETIME","CPUTIME","%CPU","RSS(MB)","STATE","WHY","CWD"))
+    for r in sorted(rows, key=lambda r: (-r["active"], -r["cpu_s"])):
+        et = r["etime"]; h,rem = divmod(et,3600); m,s = divmod(rem,60)
+        state = "ACTIVE" if r["active"] else "idle"
+        cwd = (r.get("cwd") or "-")[-40:]
+        print("%-12s %7d %3d:%02d:%02d %9.1f %6.1f %8.1f %-7s %-10s  %s" % (
+            r["tool"], r["pid"], h, m, s, r["cpu_s"], r["pcpu"], r["rss"]/1024,
+            state, r["why"], cwd))
+    idle = hid_idle_s()
+    print("\nHID idle: %ds   active: %d   alive: %d" % (
+        idle, sum(r["active"] for r in rows), len(rows)))
+    return 0
+
+def _summary(conn, since, label):
+    active_min = conn.execute(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND active=1",
+        (since,)).fetchone()[0]
+    alive_min = conn.execute(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=?",
+        (since,)).fetchone()[0]
+    by_tool = conn.execute(
+        "SELECT tool, COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND active=1 "
+        "GROUP BY tool ORDER BY 2 DESC", (since,)).fetchall()
+    peak = conn.execute(
+        "SELECT ts, COUNT(*) c FROM samples WHERE ts>=? AND active=1 "
+        "GROUP BY ts ORDER BY c DESC LIMIT 1", (since,)).fetchone()
+    night = conn.execute(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND active=1 "
+        "AND CAST(strftime('%H',ts,'unixepoch','localtime') AS INT) "
+        "BETWEEN ? AND ?",
+        (since, CFG["night_start_hour"], CFG["night_end_hour"]-1)).fetchone()[0]
+    repos = conn.execute(
+        "SELECT cwd, COUNT(DISTINCT ts) FROM samples "
+        "WHERE ts>=? AND active=1 AND cwd IS NOT NULL "
+        "GROUP BY cwd ORDER BY 2 DESC LIMIT 5", (since,)).fetchall()
+
+    print("-- touchgrass : %s --" % label)
+    print("ACTIVE minutes  : %d  (~%.1fh)" % (active_min, active_min/60))
+    print("alive  minutes  : %d  (~%.1fh)  [incl. idle terminals]" % (alive_min, alive_min/60))
+    print("night  minutes  : %d  (%02d:00-%02d:00 local)" % (
+        night, CFG["night_start_hour"], CFG["night_end_hour"]))
+    if peak:
+        t = dt.datetime.fromtimestamp(peak[0]).strftime("%a %H:%M")
+        print("peak concurrent : %d active at %s" % (peak[1], t))
+    if by_tool:
+        print("by tool (active):")
+        for tool, mins in by_tool:
+            print("  %-12s %5d min  (~%.1fh)" % (tool, mins, mins/60))
+    if repos:
+        print("top repos       :")
+        for cwd, mins in repos:
+            print("  %5d min  %s" % (mins, cwd))
+    verds = conn.execute(
+        "SELECT rule, COUNT(*) FROM verdicts WHERE ts>=? GROUP BY rule ORDER BY 2 DESC",
+        (since,)).fetchall()
+    if verds:
+        print("verdicts        :")
+        for rule, n in verds:
+            print("  %-22s %d" % (rule, n))
+
+def cmd_today(_a):
+    conn = db()
+    start = int(dt.datetime.now().replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+    _summary(conn, start, "today"); return 0
+
+def cmd_week(_a):
+    conn = db(); _summary(conn, int(time.time())-7*86400, "last 7 days"); return 0
+
+def cmd_tail(args):
+    conn = db()
+    rows = conn.execute(
+        "SELECT ts, severity, rule, payload FROM verdicts ORDER BY ts DESC LIMIT ?",
+        (args.n,)).fetchall()
+    for ts, sev, rule, payload in rows:
+        t = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        print("%s  [%s] %-22s %s" % (t, sev, rule, payload))
+    return 0
+
+def cmd_kill_stale(args):
+    conn = db(); now = int(time.time())
+    rows = snapshot(); compute_activity(conn, now, rows)
+    victims = []
+    for r in rows:
+        if r["tool"] in CFG["ignored_tools"]: continue
+        if r["etime"] < CFG["forgotten_alive_h"]*3600: continue
+        last_active = conn.execute(
+            "SELECT MAX(ts) FROM samples WHERE pid=? AND active=1",
+            (r["pid"],)).fetchone()[0]
+        quiet_for = (now - last_active) if last_active else r["etime"]
+        if quiet_for >= CFG["forgotten_idle_h"]*3600:
+            victims.append((r, quiet_for))
+    if not victims:
+        print("no stale AI procs."); return 0
+    for r, q in victims:
+        print("STALE  pid=%d  tool=%s  alive=%.0fh  idle=%.0fh  cwd=%s" % (
+            r["pid"], r["tool"], r["etime"]/3600, q/3600, r.get("cwd") or "-"))
+    if args.kill:
+        for r, _ in victims:
+            try: os.kill(r["pid"], 15); print("SIGTERM -> %d" % r["pid"])
+            except Exception as e: print("kill %d failed: %s" % (r["pid"], e))
+    else:
+        print("\n(dry-run; pass --kill to send SIGTERM)")
+    return 0
+
+def cmd_doctor(_a):
+    ok = [True]
+    def check(name, fn):
+        try:
+            r = fn(); status = "ok   " if r else "WARN "
+            if not r: ok[0] = False
+            print(" [%s] %s" % (status, name))
+        except Exception as e:
+            ok[0] = False; print(" [FAIL] %s - %s" % (name, e))
+    check("ps available",       lambda: shutil.which("ps") is not None)
+    check("lsof available",     lambda: shutil.which("lsof") is not None)
+    check("ioreg available",    lambda: shutil.which("ioreg") is not None)
+    check("osascript available",lambda: shutil.which("osascript") is not None)
+    check("db writable",        lambda: db() is not None)
+    check("config valid",       lambda: isinstance(load_config(), dict))
+    check("launchd plist file", lambda: PLIST_PATH.exists())
+    check("launchd job loaded",
+          lambda: LABEL in subprocess.run(["launchctl","list"],
+                  capture_output=True,text=True).stdout)
+    print("\nfiring test notification:")
+    notify("touchgrass - doctor", "if you see this, notifications work.")
+    print(" -> if no banner appeared, enable Notifications for 'Script Editor' in")
+    print("    System Settings > Notifications.")
+    print("\n%s" % ("ALL GOOD" if ok[0] else "SOME ISSUES - see above"))
+    return 0 if ok[0] else 1
+
+def cmd_status(_a):
+    conn = db()
+    last = conn.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
+    nsamples = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    nverds   = conn.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0]
+    db_mb = DB_PATH.stat().st_size / 1024 / 1024 if DB_PATH.exists() else 0
+    loaded = LABEL in subprocess.run(
+        ["launchctl","list"], capture_output=True, text=True).stdout
+    print("touchgrass v2  schema=%d  config=%s" % (
+        SCHEMA_VER, "custom" if CONF_PATH.exists() else "defaults"))
+    print("db        : %s  (%.2f MB, %d samples, %d verdicts)" % (
+        DB_PATH, db_mb, nsamples, nverds))
+    if last:
+        age = int(time.time()) - last
+        print("last sample : %s ago" % (
+            "%dm%ds" % (age//60, age%60) if age < 3600 else "%.1fh" % (age/3600)))
+    else:
+        print("last sample : NEVER - run `touchgrass sample` or `touchgrass init`")
+    print("launchd   : %s (%s)" % ("LOADED" if loaded else "not loaded", LABEL))
+    print("plist     : %s" % PLIST_PATH)
+    return 0
+
+def cmd_config(args):
+    if args.show:
+        print(json.dumps(CFG, indent=2)); return 0
+    if args.edit:
+        if not CONF_PATH.exists():
+            CONF_PATH.write_text(json.dumps(DEFAULTS, indent=2))
+        ed = os.environ.get("EDITOR", "vi")
+        os.execvp(ed, [ed, str(CONF_PATH)])
+    if args.reset:
+        if CONF_PATH.exists(): CONF_PATH.unlink()
+        print("reset to defaults."); return 0
+    print("use --show | --edit | --reset"); return 1
+
+# ─── launchd ─────────────────────────────────────────────────────────────
+
+PLIST_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python}</string>
+    <string>{script}</string>
+    <string>sample</string>
+  </array>
+  <key>StartInterval</key>    <integer>{interval}</integer>
+  <key>RunAtLoad</key>        <true/>
+  <key>StandardOutPath</key>  <string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"""
+
+def cmd_init(_a):
+    script = Path(__file__).resolve()
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PLIST_PATH.write_text(PLIST_TMPL.format(
+        label=LABEL, python=sys.executable, script=str(script),
+        interval=CFG["sample_interval_s"], log=str(LOG_PATH)))
+    subprocess.run(["launchctl","unload",str(PLIST_PATH)], stderr=subprocess.DEVNULL)
+    rc = subprocess.run(["launchctl","load",str(PLIST_PATH)]).returncode
+    if rc == 0:
+        print("loaded %s - sampling every %ds" % (LABEL, CFG["sample_interval_s"]))
+        print("plist : %s" % PLIST_PATH)
+        print("db    : %s" % DB_PATH)
+        print("log   : %s" % LOG_PATH)
+        print("try   : touchgrass live | touchgrass today | touchgrass doctor")
+    return rc
+
+def cmd_stop(_a):
+    rc = subprocess.run(["launchctl","unload",str(PLIST_PATH)]).returncode
+    if rc == 0: print("unloaded %s" % LABEL)
+    return rc
+
+# ─── v3: wake correlation ────────────────────────────────────────────────
+
+WAKE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*[+-]\d{4})\s+"
+    r"(Wake|DarkWake|Sleep)(?:\s{2,}|\s*$)")
+
+def parse_pmset_wakes(since_ts=None):
+    """Returns list of (ts, kind) for wake/sleep events since since_ts."""
+    try:
+        out = subprocess.run(["pmset", "-g", "log"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return []
+    events = []
+    for line in out.splitlines():
+        m = WAKE_RE.match(line)
+        if not m: continue
+        try:
+            t = dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S %z")
+            ts = int(t.timestamp())
+        except Exception: continue
+        if since_ts and ts < since_ts: continue
+        events.append((ts, m.group(2)))
+    return events
+
+def cmd_wakes(args):
+    since = int(time.time()) - args.days * 86400
+    ev = parse_pmset_wakes(since)
+    wakes  = [t for t,k in ev if k in ("Wake","DarkWake")]
+    sleeps = [t for t,k in ev if k == "Sleep"]
+    print("-- touchgrass : wakes (last %dd) --" % args.days)
+    print("wakes  : %d   sleeps : %d" % (len(wakes), len(sleeps)))
+    if not wakes: return 0
+
+    # cross-correlate with AI samples: AI proc seen within +/-2min of wake
+    conn = db()
+    suspicious = []
+    for w in wakes:
+        rows = conn.execute(
+            "SELECT DISTINCT tool, pid FROM samples "
+            "WHERE ts BETWEEN ? AND ? AND active=1",
+            (w-120, w+120)).fetchall()
+        if rows:
+            suspicious.append((w, rows))
+    if suspicious:
+        print("\nAI active at wake (%d events):" % len(suspicious))
+        for w, rows in suspicious[-args.show:]:
+            t = dt.datetime.fromtimestamp(w).strftime("%a %m-%d %H:%M")
+            tools = ", ".join("%s/%d" % (tool,pid) for tool,pid in rows)
+            print("  %s   %s" % (t, tools))
+    night = [w for w in wakes
+             if CFG["night_start_hour"] <=
+                dt.datetime.fromtimestamp(w).hour < CFG["night_end_hour"]]
+    if night:
+        print("\nnight wakes (%02d-%02d local) : %d" %
+              (CFG["night_start_hour"], CFG["night_end_hour"], len(night)))
+    return 0
+
+# ─── v3: weekly markdown digest ──────────────────────────────────────────
+
+def _digest_rows(conn, since, until):
+    def q1(sql, *a):
+        r = conn.execute(sql, a).fetchone()
+        return r[0] if r else 0
+    active_min = q1(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts BETWEEN ? AND ? AND active=1",
+        since, until)
+    alive_min = q1(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts BETWEEN ? AND ?",
+        since, until)
+    by_day = conn.execute(
+        "SELECT strftime('%Y-%m-%d',ts,'unixepoch','localtime') d, "
+        "COUNT(DISTINCT ts) FROM samples WHERE ts BETWEEN ? AND ? AND active=1 "
+        "GROUP BY d ORDER BY d", (since, until)).fetchall()
+    by_tool = conn.execute(
+        "SELECT tool, COUNT(DISTINCT ts) FROM samples "
+        "WHERE ts BETWEEN ? AND ? AND active=1 GROUP BY tool ORDER BY 2 DESC",
+        (since, until)).fetchall()
+    repos = conn.execute(
+        "SELECT cwd, COUNT(DISTINCT ts) FROM samples "
+        "WHERE ts BETWEEN ? AND ? AND active=1 AND cwd IS NOT NULL "
+        "GROUP BY cwd ORDER BY 2 DESC LIMIT 10",
+        (since, until)).fetchall()
+    peak = conn.execute(
+        "SELECT ts, COUNT(*) c FROM samples WHERE ts BETWEEN ? AND ? AND active=1 "
+        "GROUP BY ts ORDER BY c DESC LIMIT 1", (since, until)).fetchone()
+    longest = conn.execute(
+        "SELECT pid, tool, MAX(etime_s), MAX(cwd) FROM samples "
+        "WHERE ts BETWEEN ? AND ? AND active=1 GROUP BY pid "
+        "ORDER BY 3 DESC LIMIT 1", (since, until)).fetchone()
+    night = q1(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts BETWEEN ? AND ? AND active=1 "
+        "AND CAST(strftime('%H',ts,'unixepoch','localtime') AS INT) BETWEEN ? AND ?",
+        since, until, CFG["night_start_hour"], CFG["night_end_hour"]-1)
+    verdicts = conn.execute(
+        "SELECT rule, COUNT(*) FROM verdicts WHERE ts BETWEEN ? AND ? "
+        "GROUP BY rule ORDER BY 2 DESC", (since, until)).fetchall()
+    return dict(active_min=active_min, alive_min=alive_min, by_day=by_day,
+                by_tool=by_tool, repos=repos, peak=peak, longest=longest,
+                night=night, verdicts=verdicts)
+
+def cmd_digest(args):
+    until = int(time.time())
+    since = until - args.days * 86400
+    conn  = db()
+    d     = _digest_rows(conn, since, until)
+    wakes = parse_pmset_wakes(since)
+    n_wakes = sum(1 for _,k in wakes if k in ("Wake","DarkWake"))
+
+    lines = []
+    lines.append("# touchgrass digest — last %d days" % args.days)
+    lines.append("")
+    lines.append("_generated %s_" % dt.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    lines.append("")
+    lines.append("## summary")
+    lines.append("")
+    lines.append("| metric | value |")
+    lines.append("|---|---|")
+    lines.append("| ACTIVE time | %.1f h (%d min) |" % (d["active_min"]/60, d["active_min"]))
+    lines.append("| alive time  | %.1f h (incl. idle terminals) |" % (d["alive_min"]/60))
+    lines.append("| night ACTIVE (%02d-%02d) | %d min |" %
+                 (CFG["night_start_hour"], CFG["night_end_hour"], d["night"]))
+    lines.append("| machine wake events | %d |" % n_wakes)
+    if d["peak"]:
+        t = dt.datetime.fromtimestamp(d["peak"][0]).strftime("%a %m-%d %H:%M")
+        lines.append("| peak concurrency | %d agents @ %s |" % (d["peak"][1], t))
+    if d["longest"]:
+        pid, tool, et, cwd = d["longest"]
+        lines.append("| longest single session | %s (pid %d) %.1f h — `%s` |" %
+                     (tool, pid, (et or 0)/3600, cwd or "-"))
+    lines.append("")
+    if d["by_day"]:
+        lines.append("## per-day ACTIVE")
+        lines.append("")
+        lines.append("| day | active min | bar |")
+        lines.append("|---|---|---|")
+        maxv = max(v for _,v in d["by_day"]) or 1
+        for day, mins in d["by_day"]:
+            bar = "█" * int(40 * mins / maxv)
+            lines.append("| %s | %d | %s |" % (day, mins, bar))
+        lines.append("")
+    if d["by_tool"]:
+        lines.append("## by tool")
+        lines.append("")
+        for tool, mins in d["by_tool"]:
+            lines.append("- **%s** — %.1f h" % (tool, mins/60))
+        lines.append("")
+    if d["repos"]:
+        lines.append("## top repos")
+        lines.append("")
+        for cwd, mins in d["repos"]:
+            lines.append("- `%s` — %.1f h" % (cwd, mins/60))
+        lines.append("")
+    if d["verdicts"]:
+        lines.append("## verdicts fired")
+        lines.append("")
+        for rule, n in d["verdicts"]:
+            lines.append("- `%s` × %d" % (rule, n))
+        lines.append("")
+    lines.append("---")
+    lines.append("_take a walk._")
+    text = "\n".join(lines) + "\n"
+
+    if args.out:
+        Path(args.out).write_text(text)
+        print("wrote %s" % args.out)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+# ─── v3: friction shim ───────────────────────────────────────────────────
+
+SHIM_DIR = ROOT / "shims"
+SHIM_TOOLS = ["claude", "opencode", "copilot", "codex", "aider"]
+SHIM_TEMPLATE = r"""#!/usr/bin/env python3
+# touchgrass friction shim - generated, do not edit.
+import os, sys, subprocess
+TOOL = "__TOUCHGRASS_TOOL__"
+if os.environ.get("TOUCHGRASS_FORCE") == "1" or "--force" in sys.argv:
+    sys.argv = [a for a in sys.argv if a != "--force"]
+else:
+    try:
+        out = subprocess.run(["touchgrass","_check",TOOL], capture_output=True,
+                             text=True, timeout=3).stdout
+        if out.strip():
+            sys.stderr.write("\n" + out + "\n")
+            try:
+                ans = input("continue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans != "y":
+                sys.stderr.write("aborted by touchgrass. (--force or TOUCHGRASS_FORCE=1 to bypass)\n")
+                sys.exit(130)
+    except Exception:
+        pass
+shim_dir = os.path.dirname(os.path.abspath(__file__))
+path = [p for p in os.environ.get("PATH","").split(":")
+        if os.path.abspath(p) != shim_dir]
+real = None
+for p in path:
+    cand = os.path.join(p, TOOL)
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        real = cand; break
+if not real:
+    sys.stderr.write("touchgrass shim: " + TOOL + " not found outside " + shim_dir + "\n")
+    sys.exit(127)
+os.execv(real, [real] + sys.argv[1:])
+"""
+
+def cmd_shim(args):
+    SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    if args.action == "install":
+        tools = args.tools or SHIM_TOOLS
+        for t in tools:
+            p = SHIM_DIR / t
+            p.write_text(SHIM_TEMPLATE.replace("__TOUCHGRASS_TOOL__", t))
+            p.chmod(0o755)
+            print("installed shim: %s" % p)
+        print("\nadd this dir to the FRONT of your PATH:")
+        print('  export PATH="%s:$PATH"' % SHIM_DIR)
+        print("(put it in ~/.zshrc or ~/.bashrc to persist)")
+    elif args.action == "uninstall":
+        for p in SHIM_DIR.iterdir():
+            try: p.unlink(); print("removed %s" % p)
+            except OSError: pass
+    elif args.action == "list":
+        if not SHIM_DIR.exists() or not any(SHIM_DIR.iterdir()):
+            print("(no shims installed)")
+        else:
+            for p in sorted(SHIM_DIR.iterdir()):
+                print(p)
+        sd = str(SHIM_DIR)
+        on_path = sd in os.environ.get("PATH","").split(":")
+        print("\non PATH: %s" % ("yes" if on_path else "NO -- add it to ~/.zshrc"))
+    return 0
+
+def cmd__check(args):
+    """Hidden cmd called by shims. Prints a banner if today exceeds limits."""
+    conn = db()
+    start = int(dt.datetime.now().replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+    active_min = conn.execute(
+        "SELECT COUNT(DISTINCT ts) FROM samples WHERE ts>=? AND active=1",
+        (start,)).fetchone()[0]
+    h = active_min / 60.0
+    limit = CFG["daily_active_hours"]
+    msgs = []
+    if h >= limit:
+        msgs.append("┌─ touchgrass ─────────────────────────────────────────────┐")
+        msgs.append("│ you've already had %4.1f h of ACTIVE AI today (limit %dh).%s│" %
+                    (h, limit, " " * max(0, 2 - len(str(limit)))))
+        msgs.append("│ launching: %-42s│" % args.tool)
+        msgs.append("│ consider stepping away. read the diff yourself.      │")
+        msgs.append("└──────────────────────────────────────────────────────┘")
+    if msgs:
+        sys.stdout.write("\n".join(msgs))
+    return 0
+
+# ─── main ────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(prog="touchgrass")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for c in ("watch","sample","live","today","week","init","stop","doctor","status"):
+        sub.add_parser(c)
+    t  = sub.add_parser("tail");       t.add_argument("-n", type=int, default=20)
+    k  = sub.add_parser("kill-stale"); k.add_argument("--kill", action="store_true")
+    cf = sub.add_parser("config")
+    cf.add_argument("--show",  action="store_true")
+    cf.add_argument("--edit",  action="store_true")
+    cf.add_argument("--reset", action="store_true")
+    w  = sub.add_parser("wakes")
+    w.add_argument("--days", type=int, default=7)
+    w.add_argument("--show", type=int, default=20)
+    dg = sub.add_parser("digest")
+    dg.add_argument("--days", type=int, default=7)
+    dg.add_argument("--out",  type=str, default=None)
+    sh = sub.add_parser("shim")
+    sh.add_argument("action", choices=["install","uninstall","list"])
+    sh.add_argument("tools", nargs="*")
+    ck = sub.add_parser("_check")
+    ck.add_argument("tool")
+    a = p.parse_args()
+    return {
+        "watch":cmd_watch, "sample":cmd_sample, "live":cmd_live,
+        "today":cmd_today, "week":cmd_week,     "init":cmd_init,
+        "stop":cmd_stop,   "tail":cmd_tail,     "doctor":cmd_doctor,
+        "status":cmd_status, "kill-stale":cmd_kill_stale, "config":cmd_config,
+        "wakes":cmd_wakes, "digest":cmd_digest, "shim":cmd_shim, "_check":cmd__check,
+    }[a.cmd](a)
+
+if __name__ == "__main__":
+    sys.exit(main())
